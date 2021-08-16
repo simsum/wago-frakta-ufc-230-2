@@ -1,0 +1,182 @@
+PROGRAM FraktaMaster_ // Programm Frakta BSK Module auslesen maximal 32 Module je Master
+
+VAR										
+	SerialMaster  					: 	FbMbMasterSerial := (
+							 			xConnect    := TRUE,
+                                        udiBaudrate := 9600,
+                                        usiDataBits := 8,
+                                        eParity     := WagoTypesCom.eTTYParity.None,
+                                        eStopBits   := WagoTypesCom.eTTYStopBits.One,
+                                        eHandshake  := WagoTypesCom.eTTYHandshake.None,
+                                        ePhysical   := WagoTypesCom.eTTYPhysicalLayer.RS485_HalfDuplex,
+                                        eFrameType  := eMbFrameType.RTU,
+                                        tTimeOut    := T#100MS
+                                         );
+	// Joblist Arraygröße = Anzahl der Module, Initwerte = Moduladressen ... 
+	bUnitIdModul					: 	ARRAY [1..2] OF BYTE := 
+										[1,2];
+	uiMaxErrorCounter				: 	UINT := 30;	//Grenzwert Fehlerzähler bis xError TRUE wird											 
+	iJobNumber						: 	UINT := 1;	//aktueller Job											 
+										 
+	utQuery    						: 	typMbQuery := ( 
+										bUnitId         := 0,       // Address
+                                   		bFunctionCode   := 3,   	// Funktion
+                                   		uiReadAddress   := 0,       // Startaddresse
+                                   		uiReadQuantity  := 42,      // Anzahl
+                                   		uiWriteAddress  := 0,       // not needed for FC4
+                                   		uiWriteQuantity := 0,       // not needed for FC4
+                                   		awWriteData     := [124(0)] // not needed for FC4
+                                    	);
+	xTxTrigger     					: 	BOOL;  
+	utResponse      				: 	typMbResponse; 
+	tonDelay        				: 	TON :=  (PT := T#20MS); //Pause zwischen den Abfragen
+
+	xIsConnected					: 	BOOL;
+		
+	utModule						: 	ARRAY [1..32] OF typFireDamperValues;  //Datenmodell BSK Modul
+										
+	FTrigJobFinish					: 	F_TRIG;	 // Flanke wenn Job beendet
+	xWriteJob						:	BOOL 	:= FALSE; 	//Umschaltung zwischen lesen und schreiben 0=lesen / 1=schreiben 
+	xFTrigJobFinish					: 	BOOL; // Job beendet
+	xFTrigJobFinishRead 			: 	BOOL; // Lese Job beendet
+	xFTrigJobsFinishWrite 			: 	BOOL; // Schreib Jobs beendet
+	
+	uiWriteAddress					:	UINT;
+	arWriteAddress					: 	ARRAY [1..10] OF UINT := // Schreib Adressen Array,
+										[7,8,25,26,27,28,34,35,41,42]; 
+	iWriteJobNumber					: 	INT := 1;
+END_VAR
+
+//Debug Schreibbefehle testen
+utModule[1].xSetDamper1Relay;
+utModule[1].xSetDamper2Relay;
+utModule[1].xSetDamper1FullAutoTest;
+utModule[1].xSetDamper2FullAutoTest;
+utModule[1].xSetFactoryDefault;
+utModule[1].xSetClearMessage;
+utModule[1].rSetDamper1CheckTime;
+utModule[1].rSetDamper2CheckTime;
+utModule[1].rSetDelayAlarmCommunication;
+utModule[1].xSetLogicAlarmCommunication;
+
+//Limits überwachen ("upper_bound", Größe vom Array bestimmen)
+IF  iJobNumber<0 OR iJobNumber	> UPPER_BOUND(bUnitIdModul,1) THEN
+	iJobNumber:=1;
+END_IF
+IF  iWriteJobNumber<0 OR iWriteJobNumber > UPPER_BOUND(arWriteAddress,1) THEN
+	iWriteJobNumber:=1;
+END_IF
+		
+
+// richtige Moduladressen übergeben
+utQuery.bUnitId:= bUnitIdModul[iJobNumber]; 
+
+// Umschaltung zwischen lesen und schreiben
+utQuery.bFunctionCode		:= SEL	(xWriteJob, 3, 6);
+utQuery.uiReadAddress		:= SEL	(xWriteJob, 0, 0);
+utQuery.uiReadQuantity		:= SEL	(xWriteJob, 42, 0);
+utQuery.uiWriteAddress		:= SEL	(xWriteJob, 0, uiWriteAddress);
+utQuery.uiWriteQuantity		:= SEL	(xWriteJob, 0, 1);
+
+// Funktionsblock Seriale Schnittstelle aufrufen
+SerialMaster(
+	I_Port:= 		COM2, 
+	xIsConnected=> 	xIsConnected, 
+	utQuery:= 		utQuery, 
+	xTrigger:= 		xTxTrigger, 
+	utResponse:= 	utResponse
+);
+
+// wenn verbunden dann abfragen, kurze Pause zwischen den Abfragen
+IF xIsConnected THEN
+	tonDelay( 
+		IN := (NOT tonDelay.Q) AND (NOT xTxTrigger)
+			);
+	xTxTrigger S= tonDelay.Q; 
+
+	FTrigJobFinish(
+			CLK:= xTxTrigger, 
+			Q=> xFTrigJobFinish
+		);
+	
+	xFTrigJobFinishRead:= 			xFTrigJobFinish AND NOT xWriteJob;	
+	xFTrigJobsFinishWrite:= 			xFTrigJobFinish AND  xWriteJob;
+	
+	IF xFTrigJobFinishRead THEN
+				// Kommunikationsfehler eintragen bzw. rücksetzen
+				utModule[iJobNumber].xErrorCommunication			:= utModule[iJobNumber].uiErrorCounter >= uiMaxErrorCounter; //Erst nach x Fehlern den Fehler melden	
+				utModule[iJobNumber].sErrorDescription				:= SerialMaster.oStatus.sDescription;
+				IF utModule[iJobNumber].xErrorCommunication THEN	// Im Fehlerfall alle Werte zurücksetzen
+					onErrorCommunication();	//Alle Variablen auf "null"
+				END_IF
+			IF NOT SerialMaster.xError THEN // Antwort Daten richtig eintragen
+				utModule[iJobNumber].wSoftwareVersion				:= TO_WORD(utResponse.awData[0]);
+				utModule[iJobNumber].xDamper1Relay 					:= TO_BOOL(utResponse.awData[7]);
+				utModule[iJobNumber].xDamper2Relay 					:= TO_BOOL(utResponse.awData[8]);
+				utModule[iJobNumber].xDamper1OverrideEffective 		:= TO_BOOL(utResponse.awData[15]);
+				utModule[iJobNumber].xDamper2OverrideEffective 		:= TO_BOOL(utResponse.awData[16]);
+				utModule[iJobNumber].xDamper1Moving	 				:= TO_BOOL(utResponse.awData[17]);
+				utModule[iJobNumber].xDamper2Moving	 				:= TO_BOOL(utResponse.awData[18]);
+				utModule[iJobNumber].xDamper1Close	 				:= TO_BOOL(utResponse.awData[21]);
+				utModule[iJobNumber].xDamper1Open	 				:= TO_BOOL(utResponse.awData[22]);
+				utModule[iJobNumber].xDamper2Close	 				:= TO_BOOL(utResponse.awData[23]);
+				utModule[iJobNumber].xDamper2Open	 				:= TO_BOOL(utResponse.awData[24]);
+				utModule[iJobNumber].xDamper1FullAutoTest			:= TO_BOOL(utResponse.awData[25]);
+				utModule[iJobNumber].xDamper2FullAutoTest			:= TO_BOOL(utResponse.awData[26]);
+				utModule[iJobNumber].xFactoryDefault				:= TO_BOOL(utResponse.awData[27]);
+				utModule[iJobNumber].xClearMessage					:= TO_BOOL(utResponse.awData[28]);
+				utModule[iJobNumber].rDamper1CheckTime 				:= TO_REAL(utResponse.awData[34]);
+				utModule[iJobNumber].rDamper2CheckTime 				:= TO_REAL(utResponse.awData[35]);
+				utModule[iJobNumber].rDamper1SystemStatus			:= TO_REAL(utResponse.awData[36]);
+				utModule[iJobNumber].rDamper2SystemStatus		 	:= TO_REAL(utResponse.awData[37]);
+				utModule[iJobNumber].rDelayAlarmCommunication		:= TO_REAL(utResponse.awData[41]);
+				utModule[iJobNumber].xLogicAlarmCommunication		:= TO_BOOL(utResponse.awData[42]);
+				utModule[iJobNumber].uiErrorCounter					:= 0; // wenn kein Fehler mehr ist, Counter zurücksetzen
+			ELSE
+				// Im Fehlerfall den Fehlerzähler um eins erhöhen
+				utModule[iJobNumber].uiErrorCounter					:= utModule[iJobNumber].uiErrorCounter + 1;
+			END_IF
+
+		// Auf schreiben umschalten
+		xWriteJob:= TRUE;
+		//Job Zähler um eins erhöhen
+	//	iJobNumber:= iJobNumber + 1;	
+	END_IF	
+	IF xWriteJob THEN
+		uiWriteAddress:= arWriteAddress[iWriteJobNumber];
+			CASE iWriteJobNumber OF		
+				1: // 7 SetRelay Damper 1
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetDamper1Relay);
+				2: // 2 SetRelay Damper 2
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetDamper2Relay);
+				3: // 25 FullAutoTest Damper 1
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetDamper1FullAutoTest);
+				4: // 26 FullAutoTest Damper 2
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetDamper2FullAutoTest);
+				5: // 27 SetFactoryDefault 
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetFactoryDefault);
+				6: // 28 Clear Message 
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetClearMessage);
+				7: // 34 Check Time Damper 1
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].rSetDamper1CheckTime);
+				8: // 35 Check Time Damper 2 
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].rSetDamper2CheckTime);
+				9: // 41 Delay Alarm Communication 
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].rSetDelayAlarmCommunication);
+				10: // 42 Logic Alarm Communication
+					utQuery.awWriteData[0]:=TO_WORD(utModule[iJobNumber].xSetLogicAlarmCommunication);
+			ELSE
+				utQuery.awWriteData[0]:= 0 ; 
+			END_CASE;	
+		IF xFTrigJobsFinishWrite THEN
+			iWriteJobNumber:= iWriteJobNumber + 1;
+
+		END_IF
+		IF xFTrigJobsFinishWrite AND iWriteJobNumber > UPPER_BOUND(arWriteAddress,1) THEN
+			iJobNumber:= iJobNumber + 1;
+			xWriteJob:= FALSE;
+		END_IF
+	END_IF
+END_IF	
+
+
